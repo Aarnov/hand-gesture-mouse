@@ -3,50 +3,37 @@ import mediapipe as mp
 import pyautogui
 import math
 import numpy as np
+import time
+import win32gui
+import win32con
 
 # --- Configuration Constants ---
-# Smoothing factor to make mouse movement less jittery (higher value = smoother)
-SMOOTHING = 7
-
-# Define an "active area" on the camera feed to map to the screen.
-# This creates a "dead zone" at the edges, making it easier to control.
-# Values are percentages of the frame (0.0 to 1.0)
-CAM_ACTIVE_X_START = 0.1  # 10% from the left
-CAM_ACTIVE_X_END = 0.9    # 10% from the right
-CAM_ACTIVE_Y_START = 0.1  # 10% from the top
-CAM_ACTIVE_Y_END = 0.9    # 10% from the bottom
-
-# Threshold for pinch-to-click (distance between thumb and index finger)
-# You may need to adjust this value based on your camera and preference.
-PINCH_THRESHOLD = 30
+SMOOTHING = 3           # smaller = more responsive
+CURSOR_SENSITIVITY = 7.0  # how much cursor moves relative to hand
+SCROLL_SENSITIVITY = 1.5  # how much scroll moves relative to hand (Adjusted)
+CAM_ACTIVE_X_START = 0.1
+CAM_ACTIVE_X_END = 0.9
+CAM_ACTIVE_Y_START = 0.1
+CAM_ACTIVE_Y_END = 0.9
+PINCH_THRESHOLD = 30      # Increased for easier clicking
+DOUBLE_CLICK_WINDOW = 0.5
+SCROLL_THRESHOLD = 5
+SCROLL_SPEED = 50
+DEADZONE = 10           # deadzone for scroll clutch
+THUMB_PERPENDICULAR_THRESHOLD = 25 # Max horizontal distance for a "straight up" thumb
 
 # --- Initialization ---
-
-# Enable PyAutoGUI's failsafe (move mouse to a corner to stop)
 pyautogui.FAILSAFE = True
-
-# Get screen dimensions
 SCREEN_WIDTH, SCREEN_HEIGHT = pyautogui.size()
 
-# Initialize webcam
-# --- MODIFIED LINE ---
-# Added cv2.CAP_DSHOW. This is a common fix for Windows
-# to prevent "green lines" and improve camera stability.
 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-# --- END OF MODIFIED LINE ---
-
-# --- NEW LINES TO SET A STABLE RESOLUTION ---
-# We set a lower resolution (640x480) to improve performance and stability
-# This often fixes issues with "choppy" video or green/corrupted frames.
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-# --- END OF NEW LINES ---
 
 if not cap.isOpened():
     print("Error: Could not open webcam.")
     exit()
 
-# Get camera frame dimensions (we'll read one frame to get this)
 success, frame = cap.read()
 if not success:
     print("Error: Could not read frame from webcam.")
@@ -54,132 +41,246 @@ if not success:
     exit()
 FRAME_HEIGHT, FRAME_WIDTH, _ = frame.shape
 
-# Initialize MediaPipe Hands
 mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.5
-)
+hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.5)
 mp_drawing = mp.solutions.drawing_utils
 
-# --- State Variables ---
-# To prevent rapid-fire clicking, we'll use a state variable
 click_state = False
-# Variables for smoothing mouse movement
+right_click_state = False
+last_click_time = 0
+scroll_anchor = None      # Anchor point for scroll
+scroll_state = None
 prev_mouse_x, prev_mouse_y = pyautogui.position()
+window_set_topmost = False
 
-print("Hand tracker initialized. Move your hand in front of the camera.")
-print(f"Screen size: {SCREEN_WIDTH}x{SCREEN_HEIGHT}")
-print("Move mouse to any corner to quit.")
+# --- State for Relative Mouse Movement ---
+prev_hand_x, prev_hand_y = 0, 0
+pointing_clutch_engaged = False
 
-# --- Main Loop ---
+print("Hand tracker initialized. Move mouse to any corner to quit.")
+
+# --- Helper function for 2D landmark distance ---
+def get_dist(p1, p2):
+    """Calculates the 2D Euclidean distance between two MediaPipe landmarks."""
+    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
 try:
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
-            print("Ignoring empty camera frame.")
             continue
 
-        # --- MODIFIED LINE ---
-        # Flip the frame horizontally for a natural mirror view
-        # We are commenting this out, as it might conflict with the
-        # cv2.CAP_DSHOW driver and cause the "inverting" bug.
-        # frame = cv2.flip(frame, 1)
-        # --- END OF MODIFIED LINE ---
+        # --- FLIP FRAME for intuitive control ---
+        frame = cv2.flip(frame, 1)
 
-        # Convert the BGR image to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Process the frame to find hands
         results = hands.process(rgb_frame)
 
-        # Draw a rectangle for the active area for visualization
         active_x1 = int(FRAME_WIDTH * CAM_ACTIVE_X_START)
         active_y1 = int(FRAME_HEIGHT * CAM_ACTIVE_Y_START)
         active_x2 = int(FRAME_WIDTH * CAM_ACTIVE_X_END)
         active_y2 = int(FRAME_HEIGHT * CAM_ACTIVE_Y_END)
+        # Green box is still drawn for visual feedback, but not used for cursor mapping
         cv2.rectangle(frame, (active_x1, active_y1), (active_x2, active_y2), (0, 255, 0), 2)
 
-        # If a hand is detected
         if results.multi_hand_landmarks:
-            hand_landmarks = results.multi_hand_landmarks[0]
+            lm = results.multi_hand_landmarks[0].landmark
+            mp_drawing.draw_landmarks(frame, results.multi_hand_landmarks[0], mp_hands.HAND_CONNECTIONS)
 
-            # Draw hand landmarks
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            # --- Finger states (Robust, orientation-independent) ---
+            
+            wrist_lm = lm[mp_hands.HandLandmark.WRIST]
+            
+            # Finger extended: Tip is further from wrist than PIP joint
+            finger_extended = [
+                get_dist(lm[mp_hands.HandLandmark.INDEX_FINGER_TIP], wrist_lm) > get_dist(lm[mp_hands.HandLandmark.INDEX_FINGER_PIP], wrist_lm),
+                get_dist(lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP], wrist_lm) > get_dist(lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP], wrist_lm),
+                get_dist(lm[mp_hands.HandLandmark.RING_FINGER_TIP], wrist_lm) > get_dist(lm[mp_hands.HandLandmark.RING_FINGER_PIP], wrist_lm),
+                get_dist(lm[mp_hands.HandLandmark.PINKY_TIP], wrist_lm) > get_dist(lm[mp_hands.HandLandmark.PINKY_PIP], wrist_lm)
+            ]
+            
+            # Finger curled: Tip is closer to wrist than PIP joint
+            finger_curled = [
+                get_dist(lm[mp_hands.HandLandmark.INDEX_FINGER_TIP], wrist_lm) < get_dist(lm[mp_hands.HandLandmark.INDEX_FINGER_PIP], wrist_lm),
+                get_dist(lm[mp_hands.HandLandmark.MIDDLE_FINGER_TIP], wrist_lm) < get_dist(lm[mp_hands.HandLandmark.MIDDLE_FINGER_PIP], wrist_lm),
+                get_dist(lm[mp_hands.HandLandmark.RING_FINGER_TIP], wrist_lm) < get_dist(lm[mp_hands.HandLandmark.RING_FINGER_PIP], wrist_lm),
+                get_dist(lm[mp_hands.HandLandmark.PINKY_TIP], wrist_lm) < get_dist(lm[mp_hands.HandLandmark.PINKY_PIP], wrist_lm)
+            ]
 
-            # Get coordinates for thumb tip (ID 4) and index finger tip (ID 8)
-            thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
-            index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            # --- Original finger_pointing logic (for left-click only) ---
+            index_finger_pointing = lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y < lm[mp_hands.HandLandmark.INDEX_FINGER_PIP].y
+            
+            # thumb_curled: Tip is closer to index MCP than thumb IP joint is
+            index_mcp_lm = lm[mp_hands.HandLandmark.INDEX_FINGER_MCP]
+            thumb_tip_lm = lm[mp_hands.HandLandmark.THUMB_TIP]
+            thumb_ip_lm = lm[mp_hands.HandLandmark.THUMB_IP]
+            thumb_curled = get_dist(thumb_tip_lm, index_mcp_lm) < get_dist(thumb_ip_lm, index_mcp_lm)
 
-            # Get pixel coordinates from normalized coordinates
-            # These are the coordinates on the *camera frame*
-            index_tip_x = int(index_tip.x * FRAME_WIDTH)
-            index_tip_y = int(index_tip.y * FRAME_HEIGHT)
-            thumb_tip_x = int(thumb_tip.x * FRAME_WIDTH)
-            thumb_tip_y = int(thumb_tip.y * FRAME_HEIGHT)
+            # Key points
+            index_tip_x = int(lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].x * FRAME_WIDTH)
+            index_tip_y = int(lm[mp_hands.HandLandmark.INDEX_FINGER_TIP].y * FRAME_HEIGHT)
+            thumb_tip_x = int(lm[mp_hands.HandLandmark.THUMB_TIP].x * FRAME_WIDTH)
+            thumb_tip_y = int(lm[mp_hands.HandLandmark.THUMB_TIP].y * FRAME_HEIGHT)
+            wrist_y = int(lm[mp_hands.HandLandmark.WRIST].y * FRAME_HEIGHT)
+            wrist_x = int(lm[mp_hands.HandLandmark.WRIST].x * FRAME_WIDTH)
 
-            # --- 1. Mouse Movement (Controlled by Index Finger) ---
+            # --- Distances ---
+            dist_thumb_index = math.hypot(thumb_tip_x - index_tip_x, thumb_tip_y - index_tip_y)
+            thumb_index_dist = math.hypot(
+                lm[mp_hands.HandLandmark.THUMB_TIP].x - lm[mp_hands.HandLandmark.INDEX_FINGER_MCP].x,
+                lm[mp_hands.HandLandmark.THUMB_TIP].y - lm[mp_hands.HandLandmark.INDEX_FINGER_MCP].y
+            ) * FRAME_WIDTH
 
-            # Map the index finger's camera coordinates to the screen coordinates
-            # We use np.interp for smooth mapping from the "active area"
-            target_screen_x = np.interp(
-                index_tip_x,
-                (active_x1, active_x2),
-                (0, SCREEN_WIDTH)
-            )
-            target_screen_y = np.interp(
-                index_tip_y,
-                (active_y1, active_y2),
-                (0, SCREEN_HEIGHT)
-            )
+            # --- Gesture Properties (for stricter logic) ---
+            thumb_is_pointing_up = lm[mp_hands.HandLandmark.THUMB_TIP].y < lm[mp_hands.HandLandmark.THUMB_MCP].y
+            thumb_horizontal_dist = abs(lm[mp_hands.HandLandmark.THUMB_TIP].x - lm[mp_hands.HandLandmark.THUMB_MCP].x) * FRAME_WIDTH
+            is_perpendicular_thumbs_up = thumb_is_pointing_up and (thumb_horizontal_dist < THUMB_PERPENDICULAR_THRESHOLD)
+            
+            # Strict pointing: Index out, others curled, thumb curled
+            is_strict_pointing = finger_extended[0] and finger_curled[1] and finger_curled[2] and finger_curled[3] and thumb_curled
 
-            # Smooth the movement
-            current_mouse_x = prev_mouse_x + (target_screen_x - prev_mouse_x) / SMOOTHING
-            current_mouse_y = prev_mouse_y + (target_screen_y - prev_mouse_y) / SMOOTHING
+            # --- Scroll logic (robust with deadzone + anchor) ---
+            # Gesture: Open palm (all fingers extended)
+            if all(finger_extended):
+                if scroll_anchor is None:
+                    scroll_anchor = wrist_y
+                    scroll_state = None
 
-            # Move the mouse
-            pyautogui.moveTo(current_mouse_x, current_mouse_y)
+                delta = (wrist_y - scroll_anchor) * SCROLL_SENSITIVITY
 
-            # Update the previous position for the next frame's smoothing
-            prev_mouse_x, prev_mouse_y = current_mouse_x, current_mouse_y
+                if delta > SCROLL_THRESHOLD:
+                    pyautogui.scroll(-SCROLL_SPEED)
+                    scroll_state = 'down'
+                    scroll_anchor += SCROLL_THRESHOLD / SCROLL_SENSITIVITY
+                    print("Scrolling Down")
+                elif delta < -SCROLL_THRESHOLD:
+                    pyautogui.scroll(SCROLL_SPEED)
+                    scroll_state = 'up'
+                    scroll_anchor -= SCROLL_THRESHOLD / SCROLL_SENSITIVITY
+                    print("Scrolling Up")
+                elif abs(delta) < DEADZONE:
+                    scroll_state = None  # reset to allow re-arming
 
-            # --- 2. Click Detection (Pinch Gesture) ---
-
-            # Calculate the distance between thumb and index finger
-            distance = math.hypot(thumb_tip_x - index_tip_x, thumb_tip_y - index_tip_y)
-
-            # Draw a line between the two tips
-            cv2.line(frame, (thumb_tip_x, thumb_tip_y), (index_tip_x, index_tip_y), (255, 0, 0), 3)
-
-            # Check for pinch
-            if distance < PINCH_THRESHOLD:
-                # If we are not already in a "clicked" state, click once
-                if not click_state:
-                    pyautogui.click()
-                    click_state = True
-                    print("Click!")
-                # Change line color to green when pinching
-                cv2.line(frame, (thumb_tip_x, thumb_tip_y), (index_tip_x, index_tip_y), (0, 255, 0), 3)
-            else:
-                # Reset the click state if fingers are apart
+                cv2.putText(frame, "SCROLL MODE", (active_x1+10, active_y1+50),
+                            cv2.FONT_HERSHEY_SIMPLEX,1,(0,0,255),2)
+                cv2.circle(frame, (wrist_x, wrist_y), 15, (0, 0, 255), -1)
                 click_state = False
+                right_click_state = False
+                pointing_clutch_engaged = False # Disengage pointing clutch
 
-        # Display the frame
+            # --- Left click (pinch) ---
+            # Gesture: Index finger tip and thumb tip close together
+            elif not index_finger_pointing and dist_thumb_index < PINCH_THRESHOLD:
+                if not click_state:
+                    now = time.time()
+                    if now - last_click_time < DOUBLE_CLICK_WINDOW:
+                        # This is the *second* click. The first was already sent.
+                        # Send a *single* click, and the OS will interpret the pair as a double-click.
+                        pyautogui.click() # <-- CHANGED from pyautogui.doubleClick()
+                        last_click_time = 0 # Reset to prevent triple-click
+                        print("Double Click!")
+                    else:
+                        # This is the *first* click.
+                        pyautogui.click()
+                        last_click_time = now # Set to 'now' to listen for a second click
+                        print("Click!")
+                    click_state = True
+                cv2.line(frame,(thumb_tip_x,thumb_tip_y),(index_tip_x,index_tip_y),(0,255,0),3)
+                scroll_anchor = None
+                right_click_state = False
+                pointing_clutch_engaged = False # Disengage pointing clutch
+
+            # --- Right click (thumbs up) ---
+            # Gesture: Thumb is pointing STRAIGHT up, all other 4 fingers are curled
+            elif is_perpendicular_thumbs_up and all(finger_curled) and thumb_index_dist > 40:
+                if not right_click_state:
+                    pyautogui.rightClick()
+                    right_click_state = True
+                    print("Right Click!")
+                cv2.circle(frame,(thumb_tip_x,thumb_tip_y),10,(0,255,0),-1)
+                cv2.putText(frame, "RIGHT CLICK", (active_x1+10, active_y1+50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0),2)
+                scroll_anchor = None
+                click_state = False
+                pointing_clutch_engaged = False # Disengage pointing clutch
+
+            # --- Mouse move (STRICT pointing) ---
+            # Gesture: Index finger extended, all other 3 fingers + thumb curled
+            elif is_strict_pointing:
+                scroll_anchor = None
+                click_state = False
+                right_click_state = False
+                cv2.putText(frame, "MOVING CURSOR", (active_x1+10, active_y1+50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255),2)
+
+                # --- Relative (Clutch) Movement Logic ---
+                if not pointing_clutch_engaged:
+                    pointing_clutch_engaged = True
+                    # Set the 'previous' hand position to the current one on first frame
+                    prev_hand_x, prev_hand_y = index_tip_x, index_tip_y
+                    # Get the most recent mouse position as the starting point
+                    prev_mouse_x, prev_mouse_y = pyautogui.position()
+                
+                # Set target_x/y to be relative to the hand's delta
+                # This works with the existing smoothing logic below
+                target_x = prev_mouse_x + (index_tip_x - prev_hand_x)
+                target_y = prev_mouse_y + (index_tip_y - prev_hand_y)
+                
+                # Apply smoothing
+                dx = (target_x - prev_mouse_x) * CURSOR_SENSITIVITY
+                dy = (target_y - prev_mouse_y) * CURSOR_SENSITIVITY
+
+                current_mouse_x = prev_mouse_x + dx / SMOOTHING
+                current_mouse_y = prev_mouse_y + dy / SMOOTHING
+                
+                pyautogui.moveTo(current_mouse_x, current_mouse_y)
+                
+                # Update prev_mouse for the *next* frame's smoothing calc
+                prev_mouse_x, prev_mouse_y = current_mouse_x, current_mouse_y
+                # Update prev_hand for the *next* frame's delta calc
+                prev_hand_x, prev_hand_y = index_tip_x, index_tip_y
+
+                cv2.circle(frame,(index_tip_x,index_tip_y),10,(0,255,255),-1)
+
+            # --- Idle ---
+            else:
+                scroll_anchor = None
+                scroll_state = None
+                click_state = False
+                right_click_state = False
+                pointing_clutch_engaged = False # Disengage pointing clutch
+
+        else:
+            # No hand detected
+            scroll_anchor = None
+            scroll_state = None
+            click_state = False
+            right_click_state = False
+            pointing_clutch_engaged = False # Disengage pointing clutch
+
         cv2.imshow('Hand Controlled Mouse', frame)
 
-        # Exit loop if 'q' is pressed
-        if cv2.waitKey(5) & 0xFF == ord('q'):
+        # Always on top
+        if not window_set_topmost:
+            try:
+                hwnd = win332gui.FindWindow(None,'Hand Controlled Mouse')
+                if hwnd:
+                    win32gui.SetWindowPos(hwnd,win32con.HWND_TOPMOST,0,0,0,0,
+                                        win32con.SWP_NOMOVE|win32con.SWP_NOSIZE)
+                    window_set_topmost = True
+            except: 
+                window_set_topmost = True # Give up if it fails
+
+        if cv2.waitKey(5)&0xFF==ord('q'):
             break
 
 except pyautogui.FailSafeException:
-    print("Failsafe triggered. Exiting.")
+    print("Failsafe triggered.")
 except KeyboardInterrupt:
-    print("Program stopped by user.")
+    print("Stopped by user.")
 finally:
-    # Release resources
     cap.release()
     cv2.destroyAllWindows()
     hands.close()
-    print("Resources released. Goodbye!")
+    print("Resources released.")
 
